@@ -33,10 +33,10 @@ import (
 )
 
 type imageMetadata struct {
-	ID          string
-	RepoTags    []string
-	RepoDigests []string
-	Size        int64
+	ID          string   `json:"id"`
+	RepoTags    []string `json:"repo_tags"`
+	RepoDigests []string `json:"repo_digests"`
+	Size        int64    `json:"size"`
 }
 
 type ImageService struct {
@@ -102,18 +102,18 @@ func NewImageService() *ImageService {
 
 // PullImage implements image pulling functionality
 func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *runtime.AuthConfig) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	named, err := reference.ParseNormalizedNamed(imageRef)
 	if err != nil {
 		return "", fmt.Errorf("invalid image reference: %v", err)
 	}
 
 	// Check if image already exists
-	if _, ok := s.images[imageRef]; ok {
-		return imageRef, nil
+	s.mu.RLock()
+	if img, ok := s.images[imageRef]; ok {
+		defer s.mu.RUnlock()
+		return img.ID, nil
 	}
+	s.mu.RUnlock()
 
 	// Build Registry API URL
 	registry := reference.Domain(named)
@@ -136,34 +136,29 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 		return "", err
 	}
 
-	// Add manifest type headers
-	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
-	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
-	req.Header.Add("Accept", "application/vnd.oci.image.index.v1+json")
-
 	if auth != nil {
 		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to get manifest: %v", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get manifest: %s (URL: %s)", resp.Status, manifestURL)
+		return "", fmt.Errorf("failed to get manifest: %s", resp.Status)
 	}
 
-	// Parse manifest
 	var manifest DockerManifest
 	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return "", fmt.Errorf("failed to parse manifest: %v", err)
+		return "", fmt.Errorf("failed to decode manifest: %v", err)
 	}
 
 	// Create image directory
-	imageDir := filepath.Join(s.imageRoot, digest.FromString(imageRef).Hex())
+	dgst := digest.FromString(imageRef)
+	imageID := fmt.Sprintf("sha256:%x", dgst.Hex())
+	imageDir := filepath.Join(s.imageRoot, dgst.Hex())
 	if err := os.MkdirAll(imageDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create image directory: %v", err)
 	}
@@ -176,7 +171,6 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 			return "", fmt.Errorf("failed to create layer directory: %v", err)
 		}
 
-		// Download layer
 		layerURL := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, layer.Digest)
 		if err := s.downloadLayer(ctx, layerURL, layerDir, layer.Digest, auth); err != nil {
 			return "", fmt.Errorf("failed to download layer %d: %v", i, err)
@@ -184,21 +178,23 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 
 		totalSize += layer.Size
 	}
-
+	s.mu.Lock()
 	// Save image metadata
-	dgst := digest.FromString(imageRef)
 	s.images[imageRef] = &imageMetadata{
-		ID:          dgst.String(),
+		ID:          imageID,
 		RepoTags:    []string{imageRef},
 		RepoDigests: []string{fmt.Sprintf("%s@%s", imageRef, dgst)},
 		Size:        totalSize,
 	}
+	s.mu.Unlock()
 
 	if err := s.saveMetadata(); err != nil {
 		return "", fmt.Errorf("failed to save metadata: %v", err)
 	}
 
-	return imageRef, nil
+	// Signal completion
+	fmt.Printf("Successfully pulled image: %s\n", imageRef)
+	return imageID, nil
 }
 
 // downloadLayer downloads a single layer from the registry
@@ -292,11 +288,12 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 
 // RemoveImage implements image removal functionality
 func (s *ImageService) RemoveImage(ctx context.Context, imageRef string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// First check if image exists with read lock
+	s.mu.RLock()
+	_, exists := s.images[imageRef]
+	s.mu.RUnlock()
 
-	// Check if image exists
-	if _, ok := s.images[imageRef]; !ok {
+	if !exists {
 		return fmt.Errorf("image not found: %s", imageRef)
 	}
 
@@ -304,6 +301,15 @@ func (s *ImageService) RemoveImage(ctx context.Context, imageRef string) error {
 	imageDir := filepath.Join(s.imageRoot, digest.FromString(imageRef).Hex())
 	if err := os.RemoveAll(imageDir); err != nil {
 		return fmt.Errorf("failed to remove image directory: %v", err)
+	}
+
+	// Now acquire write lock for metadata update
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double check image still exists
+	if _, ok := s.images[imageRef]; !ok {
+		return fmt.Errorf("image was removed by another operation: %s", imageRef)
 	}
 
 	// Delete image from local storage
@@ -358,15 +364,21 @@ func (s *ImageService) GetImageRoot() string {
 
 // saveMetadata saves the image metadata to disk
 func (s *ImageService) saveMetadata() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if s.images == nil {
+		s.images = make(map[string]*imageMetadata)
+	}
 
 	data, err := json.MarshalIndent(s.images, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %v", err)
+		return fmt.Errorf("failed to marshal metadata (len=%d): %v", len(s.images), err)
 	}
 
-	tempFile := s.metadataFile + ".tmp"
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(s.metadataFile), 0755); err != nil {
+		return fmt.Errorf("failed to create metadata directory: %v", err)
+	}
+
+	tempFile := filepath.Join(filepath.Dir(s.metadataFile), filepath.Base(s.metadataFile)+".tmp")
 	if err := os.WriteFile(tempFile, data, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata: %v", err)
 	}
@@ -376,6 +388,7 @@ func (s *ImageService) saveMetadata() error {
 		return fmt.Errorf("failed to save metadata: %v", err)
 	}
 
+	fmt.Printf("Successfully saved metadata for %d images\n", len(s.images))
 	return nil
 }
 
@@ -397,4 +410,13 @@ func (s *ImageService) loadMetadata() error {
 	}
 
 	return nil
+}
+
+// AddImage safely adds an image to the service
+func (s *ImageService) AddImage(imageRef string, img *imageMetadata) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.images[imageRef] = img
+	return s.saveMetadata()
 }

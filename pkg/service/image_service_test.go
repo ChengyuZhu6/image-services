@@ -25,7 +25,9 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/opencontainers/go-digest"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -36,16 +38,35 @@ func TestImageService_PullImage(t *testing.T) {
 
 	// Setup mock registry server
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		defer func() {
+			t.Logf("Request took: %v", time.Since(start))
+		}()
+
+		// Add request logging
+		t.Logf("Received request: %s %s", r.Method, r.URL.Path)
+		defer t.Logf("Completed request: %s %s", r.Method, r.URL.Path)
+
 		switch r.URL.Path {
 		case "/v2/":
+			t.Log("Handling /v2/ request")
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+			return
 		case "/v2/library/test/blobs/" + expectedDigest:
+			t.Log("Handling blob request")
 			// Mock layer download
 			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fixedContent)))
+			w.WriteHeader(http.StatusOK)
 			w.Write(fixedContent)
+			return
 		case "/v2/library/test/manifests/latest":
+			t.Log("Handling manifest request")
 			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
-			w.Write([]byte(`{
+			w.Header().Set("Docker-Content-Digest", expectedDigest)
+			manifestContent := []byte(`{
 				"schemaVersion": 2,
 				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
 				"config": {
@@ -60,9 +81,16 @@ func TestImageService_PullImage(t *testing.T) {
 						"digest": "` + expectedDigest + `"
 					}
 				]
-			}`))
+			}`)
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(manifestContent)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(manifestContent)
+			return
 		default:
+			t.Log("Handling unknown request")
 			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"errors":[{"code":"NOT_FOUND"}]}`))
+			return
 		}
 	}))
 	defer server.Close()
@@ -76,9 +104,10 @@ func TestImageService_PullImage(t *testing.T) {
 
 	// Create service instance
 	service := &ImageService{
-		client:    server.Client(),
-		imageRoot: tmpDir,
-		images:    make(map[string]*imageMetadata),
+		client:       server.Client(),
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
 	}
 
 	// Test cases
@@ -87,26 +116,33 @@ func TestImageService_PullImage(t *testing.T) {
 		imageRef string
 		auth     *runtime.AuthConfig
 		wantErr  bool
+		wantID   string
 	}{
 		{
 			name:     "valid image pull",
 			imageRef: server.URL[8:] + "/library/test:latest", // Remove https:// prefix
 			auth:     nil,
 			wantErr:  false,
+			wantID:   fmt.Sprintf("sha256:%x", digest.FromString(server.URL[8:]+"/library/test:latest").Hex()),
 		},
 		{
 			name:     "invalid image reference",
 			imageRef: "invalid::",
 			auth:     nil,
 			wantErr:  true,
+			wantID:   "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := service.PullImage(context.Background(), tt.imageRef, tt.auth)
+			id, err := service.PullImage(context.Background(), tt.imageRef, tt.auth)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PullImage() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && id != tt.wantID {
+				t.Errorf("PullImage() got ID = %v, want %v", id, tt.wantID)
 			}
 		})
 	}
@@ -120,23 +156,35 @@ func TestImageService_RemoveImage(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Create metadata directory
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		t.Fatalf("Failed to create metadata directory: %v", err)
+	}
+
 	// Create service instance
 	service := &ImageService{
-		client:    http.DefaultClient,
-		imageRoot: tmpDir,
-		images: map[string]*imageMetadata{
-			"test:latest": {
-				ID:       "sha256:test",
-				RepoTags: []string{"test:latest"},
-				Size:     1000,
-			},
-		},
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
 	}
 
 	// Create test image directory
-	imageDir := filepath.Join(tmpDir, "test")
+	imageDir := filepath.Join(tmpDir, digest.FromString("test:latest").Hex())
 	if err := os.MkdirAll(imageDir, 0755); err != nil {
 		t.Fatalf("Failed to create image dir: %v", err)
+	}
+
+	// Add test image
+	service.images["test:latest"] = &imageMetadata{
+		ID:       "sha256:test",
+		RepoTags: []string{"test:latest"},
+		Size:     1000,
+	}
+
+	// Save initial metadata
+	if err := service.saveMetadata(); err != nil {
+		t.Fatalf("Failed to save initial metadata: %v", err)
 	}
 
 	// Test cases
@@ -451,12 +499,11 @@ func TestImageService_MetadataConsistency(t *testing.T) {
 		go func(index int) {
 			defer wg.Done()
 			imageRef := fmt.Sprintf("test%d:latest", index)
-			service.images[imageRef] = &imageMetadata{
+			err := service.AddImage(imageRef, &imageMetadata{
 				ID:       fmt.Sprintf("sha256:test%d", index),
 				RepoTags: []string{imageRef},
 				Size:     int64(index * 1000),
-			}
-			err := service.saveMetadata()
+			})
 			if err != nil {
 				t.Errorf("saveMetadata() error = %v", err)
 			}
