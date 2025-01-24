@@ -252,6 +252,11 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 		return fmt.Errorf("registry check failed: %s", resp.Status)
 	}
 
+	// Return error for unauthorized response when no auth provided
+	if resp.StatusCode == http.StatusUnauthorized && auth == nil {
+		return fmt.Errorf("authentication required")
+	}
+
 	return nil
 }
 
