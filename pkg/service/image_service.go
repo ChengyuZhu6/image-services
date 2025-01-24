@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -26,6 +27,7 @@ type ImageService struct {
 	client    *http.Client
 	imageRoot string
 	images    map[string]*imageMetadata
+	mu        sync.RWMutex
 }
 
 // DockerManifest represents a Docker image manifest
@@ -74,6 +76,9 @@ func NewImageService() *ImageService {
 
 // PullImage implements image pulling functionality
 func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *runtime.AuthConfig) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	named, err := reference.ParseNormalizedNamed(imageRef)
 	if err != nil {
 		return "", fmt.Errorf("invalid image reference: %v", err)
@@ -252,23 +257,44 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 
 // RemoveImage implements image removal functionality
 func (s *ImageService) RemoveImage(ctx context.Context, imageRef string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if image exists
+	if _, ok := s.images[imageRef]; !ok {
+		return fmt.Errorf("image not found: %s", imageRef)
+	}
+
+	// Remove image directory
+	imageDir := filepath.Join(s.imageRoot, digest.FromString(imageRef).Hex())
+	if err := os.RemoveAll(imageDir); err != nil {
+		return fmt.Errorf("failed to remove image directory: %v", err)
+	}
+
 	// Delete image from local storage
+	delete(s.images, imageRef)
+	fmt.Printf("Successfully removed image: %s\n", imageRef)
+
 	return nil
 }
 
 // ImageStatus implements image status retrieval functionality
 func (s *ImageService) ImageStatus(ctx context.Context, imageRef string) (*runtime.Image, error) {
-	named, err := reference.ParseNormalizedNamed(imageRef)
-	if err != nil {
-		return nil, fmt.Errorf("invalid image reference: %v", err)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Check if image exists in our metadata
+	if img, ok := s.images[imageRef]; ok {
+		return &runtime.Image{
+			Id:          img.ID,
+			RepoTags:    img.RepoTags,
+			RepoDigests: img.RepoDigests,
+			Size_:       uint64(img.Size),
+		}, nil
 	}
 
-	return &runtime.Image{
-		Id:          imageRef,
-		RepoTags:    []string{named.String()},
-		RepoDigests: []string{},
-		Size_:       0,
-	}, nil
+	// Image not found
+	return nil, fmt.Errorf("image not found: %s", imageRef)
 }
 
 // ListImages implements image listing functionality
