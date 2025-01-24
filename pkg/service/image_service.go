@@ -5,17 +5,32 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"os"
 
 	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+type imageMetadata struct {
+	ID          string
+	RepoTags    []string
+	RepoDigests []string
+	Size        int64
+}
 
 type ImageService struct {
 	client    *http.Client
 	imageRoot string
+	images    map[string]*imageMetadata
 }
 
 func NewImageService() *ImageService {
+	// Create image storage directory
+	if err := os.MkdirAll("/var/lib/image-service", 0755); err != nil {
+		panic(fmt.Sprintf("Failed to create image root directory: %v", err))
+	}
+
 	// Create HTTP client with insecure HTTPS support
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -26,6 +41,7 @@ func NewImageService() *ImageService {
 	return &ImageService{
 		client:    &http.Client{Transport: tr},
 		imageRoot: "/var/lib/image-service",
+		images:    make(map[string]*imageMetadata),
 	}
 }
 
@@ -34,6 +50,11 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 	named, err := reference.ParseNormalizedNamed(imageRef)
 	if err != nil {
 		return "", fmt.Errorf("invalid image reference: %v", err)
+	}
+
+	// Check if image already exists
+	if _, ok := s.images[imageRef]; ok {
+		return imageRef, nil
 	}
 
 	// Build Registry API URL
@@ -75,6 +96,15 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to get manifest: %s (URL: %s)", resp.Status, manifestURL)
+	}
+
+	// Save image metadata
+	dgst := digest.FromString(imageRef)
+	s.images[imageRef] = &imageMetadata{
+		ID:          dgst.String(),
+		RepoTags:    []string{imageRef},
+		RepoDigests: []string{fmt.Sprintf("%s@%s", imageRef, dgst)},
+		Size:        resp.ContentLength,
 	}
 
 	return imageRef, nil
@@ -127,8 +157,18 @@ func (s *ImageService) ImageStatus(ctx context.Context, imageRef string) (*runti
 
 // ListImages implements image listing functionality
 func (s *ImageService) ListImages(ctx context.Context, filter *runtime.ImageFilter) ([]*runtime.Image, error) {
-	// List images from local storage
-	return []*runtime.Image{}, nil
+	var images []*runtime.Image
+
+	for _, img := range s.images {
+		images = append(images, &runtime.Image{
+			Id:          img.ID,
+			RepoTags:    img.RepoTags,
+			RepoDigests: img.RepoDigests,
+			Size_:       uint64(img.Size),
+		})
+	}
+
+	return images, nil
 }
 
 // GetImageRoot returns the root path of image storage
