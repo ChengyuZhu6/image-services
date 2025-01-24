@@ -40,10 +40,11 @@ type imageMetadata struct {
 }
 
 type ImageService struct {
-	client    *http.Client
-	imageRoot string
-	images    map[string]*imageMetadata
-	mu        sync.RWMutex
+	client       *http.Client
+	imageRoot    string
+	images       map[string]*imageMetadata
+	mu           sync.RWMutex
+	metadataFile string
 }
 
 // DockerManifest represents a Docker image manifest
@@ -72,7 +73,8 @@ type LayerInfo struct {
 
 func NewImageService() *ImageService {
 	// Create image storage directory
-	if err := os.MkdirAll("/var/lib/image-service", 0755); err != nil {
+	imageRoot := "/var/lib/image-service"
+	if err := os.MkdirAll(imageRoot, 0755); err != nil {
 		panic(fmt.Sprintf("Failed to create image root directory: %v", err))
 	}
 
@@ -83,11 +85,19 @@ func NewImageService() *ImageService {
 		},
 	}
 
-	return &ImageService{
-		client:    &http.Client{Transport: tr},
-		imageRoot: "/var/lib/image-service",
-		images:    make(map[string]*imageMetadata),
+	service := &ImageService{
+		client:       &http.Client{Transport: tr},
+		imageRoot:    imageRoot,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(imageRoot, "metadata.json"),
 	}
+
+	// Load existing metadata
+	if err := service.loadMetadata(); err != nil {
+		panic(fmt.Sprintf("Failed to load metadata: %v", err))
+	}
+
+	return service
 }
 
 // PullImage implements image pulling functionality
@@ -182,6 +192,10 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 		RepoTags:    []string{imageRef},
 		RepoDigests: []string{fmt.Sprintf("%s@%s", imageRef, dgst)},
 		Size:        totalSize,
+	}
+
+	if err := s.saveMetadata(); err != nil {
+		return "", fmt.Errorf("failed to save metadata: %v", err)
 	}
 
 	return imageRef, nil
@@ -294,8 +308,11 @@ func (s *ImageService) RemoveImage(ctx context.Context, imageRef string) error {
 
 	// Delete image from local storage
 	delete(s.images, imageRef)
-	fmt.Printf("Successfully removed image: %s\n", imageRef)
+	if err := s.saveMetadata(); err != nil {
+		return fmt.Errorf("failed to save metadata: %v", err)
+	}
 
+	fmt.Printf("Successfully removed image: %s\n", imageRef)
 	return nil
 }
 
@@ -337,4 +354,47 @@ func (s *ImageService) ListImages(ctx context.Context, filter *runtime.ImageFilt
 // GetImageRoot returns the root path of image storage
 func (s *ImageService) GetImageRoot() string {
 	return s.imageRoot
+}
+
+// saveMetadata saves the image metadata to disk
+func (s *ImageService) saveMetadata() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(s.images, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %v", err)
+	}
+
+	tempFile := s.metadataFile + ".tmp"
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write metadata: %v", err)
+	}
+
+	if err := os.Rename(tempFile, s.metadataFile); err != nil {
+		os.Remove(tempFile)
+		return fmt.Errorf("failed to save metadata: %v", err)
+	}
+
+	return nil
+}
+
+// loadMetadata loads the image metadata from disk
+func (s *ImageService) loadMetadata() error {
+	data, err := os.ReadFile(s.metadataFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read metadata: %v", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := json.Unmarshal(data, &s.images); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %v", err)
+	}
+
+	return nil
 }
