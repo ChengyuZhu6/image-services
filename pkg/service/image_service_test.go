@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -365,5 +366,116 @@ func TestImageService_AuthHandling(t *testing.T) {
 				t.Errorf("checkRegistry() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestImageService_MetadataPersistence tests the metadata persistence functionality
+func TestImageService_MetadataPersistence(t *testing.T) {
+	// Create temp directory for test
+	tmpDir, err := os.MkdirTemp("", "metadata-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create initial service instance
+	service := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+	}
+
+	// Add test data
+	testImage := &imageMetadata{
+		ID:          "sha256:test",
+		RepoTags:    []string{"test:latest"},
+		RepoDigests: []string{"test@sha256:digest"},
+		Size:        1000,
+	}
+	service.images["test:latest"] = testImage
+
+	// Test saving metadata
+	if err := service.saveMetadata(); err != nil {
+		t.Errorf("saveMetadata() error = %v", err)
+	}
+
+	// Verify metadata file exists
+	if _, err := os.Stat(service.metadataFile); os.IsNotExist(err) {
+		t.Error("Metadata file was not created")
+	}
+
+	// Create new service instance to test loading
+	newService := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+	}
+
+	// Test loading metadata
+	if err := newService.loadMetadata(); err != nil {
+		t.Errorf("loadMetadata() error = %v", err)
+	}
+
+	// Verify loaded data
+	loadedImage, ok := newService.images["test:latest"]
+	if !ok {
+		t.Error("Failed to load image metadata")
+	}
+	if loadedImage.ID != testImage.ID {
+		t.Errorf("Loaded image ID = %v, want %v", loadedImage.ID, testImage.ID)
+	}
+}
+
+// TestImageService_MetadataConsistency tests metadata consistency during operations
+func TestImageService_MetadataConsistency(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "consistency-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	service := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		mu:           sync.RWMutex{},
+	}
+
+	// Test concurrent metadata operations
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			imageRef := fmt.Sprintf("test%d:latest", index)
+			service.images[imageRef] = &imageMetadata{
+				ID:       fmt.Sprintf("sha256:test%d", index),
+				RepoTags: []string{imageRef},
+				Size:     int64(index * 1000),
+			}
+			err := service.saveMetadata()
+			if err != nil {
+				t.Errorf("saveMetadata() error = %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify final state
+	if len(service.images) != 10 {
+		t.Errorf("Expected 10 images, got %d", len(service.images))
+	}
+
+	// Test metadata corruption resistance
+	if err := os.WriteFile(service.metadataFile+".tmp", []byte("invalid json"), 0644); err != nil {
+		t.Fatalf("Failed to write corrupt metadata: %v", err)
+	}
+
+	// Verify service can still save metadata
+	if err := service.saveMetadata(); err != nil {
+		t.Errorf("saveMetadata() error after corruption = %v", err)
 	}
 }
