@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 
@@ -15,8 +16,15 @@ type ImageService struct {
 }
 
 func NewImageService() *ImageService {
+	// Create HTTP client with insecure HTTPS support
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+
 	return &ImageService{
-		client:    &http.Client{},
+		client:    &http.Client{Transport: tr},
 		imageRoot: "/var/lib/image-service",
 	}
 }
@@ -36,12 +44,24 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 		tag = tagged.Tag()
 	}
 
+	// First check API version
+	checkURL := fmt.Sprintf("https://%s/v2/", registry)
+	if err := s.checkRegistry(ctx, checkURL, auth); err != nil {
+		return "", fmt.Errorf("failed to check registry: %v", err)
+	}
+
 	// Get manifest
 	manifestURL := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
 		return "", err
 	}
+
+	// Add manifest type headers
+	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
+	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
+	req.Header.Add("Accept", "application/vnd.oci.image.index.v1+json")
 
 	if auth != nil {
 		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
@@ -54,10 +74,34 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get manifest: %s", resp.Status)
+		return "", fmt.Errorf("failed to get manifest: %s (URL: %s)", resp.Status, manifestURL)
 	}
 
 	return imageRef, nil
+}
+
+// checkRegistry checks if the registry is accessible
+func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runtime.AuthConfig) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	if auth != nil {
+		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("registry check failed: %s", resp.Status)
+	}
+
+	return nil
 }
 
 // RemoveImage implements image removal functionality
