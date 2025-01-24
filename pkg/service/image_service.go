@@ -44,6 +44,14 @@ type DockerManifest struct {
 	} `json:"layers"`
 }
 
+// LayerInfo stores layer download information
+type LayerInfo struct {
+	MediaType string
+	Size      int64
+	Digest    string
+	Path      string
+}
+
 func NewImageService() *ImageService {
 	// Create image storage directory
 	if err := os.MkdirAll("/var/lib/image-service", 0755); err != nil {
@@ -139,7 +147,7 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 
 		// Download layer
 		layerURL := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, layer.Digest)
-		if err := s.downloadLayer(ctx, layerURL, layerDir, auth); err != nil {
+		if err := s.downloadLayer(ctx, layerURL, layerDir, layer.Digest, auth); err != nil {
 			return "", fmt.Errorf("failed to download layer %d: %v", i, err)
 		}
 
@@ -159,7 +167,7 @@ func (s *ImageService) PullImage(ctx context.Context, imageRef string, auth *run
 }
 
 // downloadLayer downloads a single layer from the registry
-func (s *ImageService) downloadLayer(ctx context.Context, url, destDir string, auth *runtime.AuthConfig) error {
+func (s *ImageService) downloadLayer(ctx context.Context, url, destDir string, expectedDigest string, auth *runtime.AuthConfig) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
@@ -182,17 +190,39 @@ func (s *ImageService) downloadLayer(ctx context.Context, url, destDir string, a
 
 	// Save layer blob
 	layerPath := filepath.Join(destDir, "layer.tar")
-	f, err := os.Create(layerPath)
+	tempPath := layerPath + ".tmp"
+	f, err := os.Create(tempPath)
 	if err != nil {
 		return fmt.Errorf("failed to create layer file: %v", err)
 	}
 	defer f.Close()
 
-	fmt.Printf("Saving layer to: %s\n", layerPath)
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	// Create digest writer to verify layer content
+	digester := digest.Canonical.Digester()
+	writer := io.MultiWriter(f, digester.Hash())
+
+	fmt.Printf("Saving layer to: %s\n", tempPath)
+	size, err := io.Copy(writer, resp.Body)
+	f.Close()
+	if err != nil {
+		os.Remove(tempPath)
 		return fmt.Errorf("failed to save layer: %v", err)
 	}
 
+	// Verify digest
+	actualDigest := digester.Digest().String()
+	if actualDigest != expectedDigest {
+		os.Remove(tempPath)
+		return fmt.Errorf("layer digest mismatch: expected %s, got %s", expectedDigest, actualDigest)
+	}
+
+	// Move verified layer to final location
+	if err := os.Rename(tempPath, layerPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to move verified layer: %v", err)
+	}
+
+	fmt.Printf("Layer verified and saved: size=%d, digest=%s\n", size, actualDigest)
 	return nil
 }
 
