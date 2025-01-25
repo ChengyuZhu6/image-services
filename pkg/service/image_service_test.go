@@ -17,12 +17,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -108,6 +110,7 @@ func TestImageService_PullImage(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	// Test cases
@@ -167,6 +170,7 @@ func TestImageService_RemoveImage(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	// Create test image directory
@@ -216,41 +220,64 @@ func TestImageService_RemoveImage(t *testing.T) {
 }
 
 func TestImageService_ImageStatus(t *testing.T) {
-	service := &ImageService{
-		images: map[string]*imageMetadata{
-			"test:latest": {
-				ID:       "sha256:test",
-				RepoTags: []string{"test:latest"},
-				Size:     1000,
-			},
-		},
+	// Create temp directory for test
+	tmpDir, err := os.MkdirTemp("", "image-status-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
 	}
+	defer os.RemoveAll(tmpDir)
+
+	service := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
+	}
+
+	// Add test image
+	testImage := &imageMetadata{
+		ID:          "sha256:test",
+		RepoTags:    []string{"test:latest"},
+		RepoDigests: []string{"test@sha256:digest"},
+		Size:        1000,
+	}
+	service.images["test:latest"] = testImage
 
 	tests := []struct {
 		name     string
 		imageRef string
+		want     *runtime.Image
 		wantErr  bool
 	}{
 		{
-			name:     "get existing image status",
+			name:     "existing image",
 			imageRef: "test:latest",
-			wantErr:  false,
+			want: &runtime.Image{
+				Id:          "sha256:test",
+				RepoTags:    []string{"test:latest"},
+				RepoDigests: []string{"test@sha256:digest"},
+				Size_:       1000,
+			},
+			wantErr: false,
 		},
 		{
-			name:     "get non-existent image status",
+			name:     "non-existent image",
 			imageRef: "nonexistent:latest",
+			want:     nil,
 			wantErr:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			img, err := service.ImageStatus(context.Background(), tt.imageRef)
+			got, err := service.ImageStatus(context.Background(), tt.imageRef)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ImageStatus() error = %v, wantErr %v", err, tt.wantErr)
+				return
 			}
-			if !tt.wantErr && img == nil {
-				t.Error("ImageStatus() returned nil image for existing image")
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ImageStatus() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -372,19 +399,71 @@ func TestImageService_ConcurrentOperations(t *testing.T) {
 
 // Test authentication handling
 func TestImageService_AuthHandling(t *testing.T) {
+	// Create temp directory for test
+	tmpDir, err := os.MkdirTemp("", "auth-handling-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Setup mock registry server
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
+		// First check authentication
 		if auth == "" {
 			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"errors":[{"code":"UNAUTHORIZED"}]}`))
 			return
-		} else {
+		}
+		if auth != "Basic dGVzdHVzZXI6dGVzdHBhc3M=" {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"errors":[{"code":"FORBIDDEN"}]}`))
+			return
+		}
+
+		switch r.URL.Path {
+		case "/v2/":
 			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{}`))
+
+		case "/v2/test/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+			manifestContent := []byte(`{
+				"schemaVersion": 2,
+				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+				"config": {
+					"mediaType": "application/vnd.docker.container.image.v1+json",
+					"size": 1000,
+					"digest": "sha256:2189176b26e9f608c27104f31fbbaa3e8342b2230d804a21568afea057689391"
+				},
+				"layers": [
+					{
+						"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+						"size": 19,
+						"digest": "sha256:2189176b26e9f608c27104f31fbbaa3e8342b2230d804a21568afea057689391"
+					}
+				]
+			}`)
+			w.Header().Set("Docker-Content-Digest", "sha256:2189176b26e9f608c27104f31fbbaa3e8342b2230d804a21568afea057689391")
+			w.Write(manifestContent)
+
+		case "/v2/test/blobs/sha256:2189176b26e9f608c27104f31fbbaa3e8342b2230d804a21568afea057689391":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write([]byte("test layer content"))
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"errors":[{"code":"NOT_FOUND"}]}`))
 		}
 	}))
 	defer server.Close()
 
 	service := &ImageService{
-		client: server.Client(),
+		client:       server.Client(),
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	tests := []struct {
@@ -398,10 +477,18 @@ func TestImageService_AuthHandling(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "invalid auth",
+			auth: &runtime.AuthConfig{
+				Username: "wrong",
+				Password: "wrong",
+			},
+			wantErr: true,
+		},
+		{
 			name: "valid auth",
 			auth: &runtime.AuthConfig{
-				Username: "test",
-				Password: "test",
+				Username: "testuser",
+				Password: "testpass",
 			},
 			wantErr: false,
 		},
@@ -409,9 +496,12 @@ func TestImageService_AuthHandling(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := service.checkRegistry(context.Background(), server.URL, tt.auth)
+			_, err := service.PullImage(context.Background(), server.URL[8:]+"/test:latest", tt.auth)
+			if err != nil {
+				t.Logf("PullImage() error: %v", err)
+			}
 			if (err != nil) != tt.wantErr {
-				t.Errorf("checkRegistry() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("PullImage() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -432,6 +522,7 @@ func TestImageService_MetadataPersistence(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	// Add test data
@@ -459,6 +550,7 @@ func TestImageService_MetadataPersistence(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	// Test loading metadata
@@ -489,6 +581,7 @@ func TestImageService_MetadataConsistency(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
 		mu:           sync.RWMutex{},
 	}
 
@@ -525,4 +618,166 @@ func TestImageService_MetadataConsistency(t *testing.T) {
 	if err := service.saveMetadata(); err != nil {
 		t.Errorf("saveMetadata() error after corruption = %v", err)
 	}
+}
+
+func TestImageService_LayerReuse(t *testing.T) {
+	// Create temporary directory
+	tmpDir, err := os.MkdirTemp("", "layer-reuse-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test service instance
+	service := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
+	}
+
+	// Create test layer
+	layerContent := []byte("test layer content")
+	layerDigest := "sha256:testlayer"
+	layerPath := filepath.Join(tmpDir, "test-layer")
+	if err := os.WriteFile(layerPath, layerContent, 0644); err != nil {
+		t.Fatalf("Failed to create test layer: %v", err)
+	}
+
+	// Add layer to cache
+	metadata := LayerMetadata{
+		Digest: layerDigest,
+		Path:   layerPath,
+		Size:   int64(len(layerContent)),
+	}
+	service.layerCache.Add(layerDigest, metadata)
+
+	// Test layer reuse
+	destPath := filepath.Join(tmpDir, "reused-layer")
+	if err := reuseLayer(layerPath, destPath); err != nil {
+		t.Errorf("reuseLayer() error = %v", err)
+	}
+
+	// Verify reused layer content
+	reusedContent, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Errorf("Failed to read reused layer: %v", err)
+	}
+	if !bytes.Equal(reusedContent, layerContent) {
+		t.Errorf("Reused layer content = %v, want %v", reusedContent, layerContent)
+	}
+
+	// Verify layer cache
+	if metadata, exists := service.layerCache.Get(layerDigest); !exists {
+		t.Error("Layer not found in cache")
+	} else if metadata.Path != layerPath {
+		t.Errorf("Layer path = %v, want %v", metadata.Path, layerPath)
+	}
+}
+
+func TestImageService_LayerCleanup(t *testing.T) {
+	// Create temporary directory
+	tmpDir, err := os.MkdirTemp("", "layer-cleanup-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test service instance
+	service := &ImageService{
+		client:       http.DefaultClient,
+		imageRoot:    tmpDir,
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
+		layerCache:   NewLayerCache(),
+	}
+
+	// Create two test layers
+	layer1 := LayerMetadata{
+		Digest: "sha256:layer1",
+		Path:   filepath.Join(tmpDir, "layer1"),
+		Size:   100,
+	}
+	layer2 := LayerMetadata{
+		Digest: "sha256:layer2",
+		Path:   filepath.Join(tmpDir, "layer2"),
+		Size:   200,
+	}
+
+	// Create layer files
+	for _, layer := range []LayerMetadata{layer1, layer2} {
+		if err := os.WriteFile(layer.Path, []byte("test"), 0644); err != nil {
+			t.Fatalf("Failed to create layer file: %v", err)
+		}
+	}
+
+	// Add two shared layer images
+	service.images["image1"] = &imageMetadata{
+		ID:     "sha256:image1",
+		Layers: []LayerMetadata{layer1, layer2},
+	}
+	service.images["image2"] = &imageMetadata{
+		ID:     "sha256:image2",
+		Layers: []LayerMetadata{layer1},
+	}
+
+	// Remove first image
+	if err := service.RemoveImage(context.Background(), "image1"); err != nil {
+		t.Errorf("RemoveImage() error = %v", err)
+	}
+
+	// Verify shared layer (layer1) still exists
+	if _, err := os.Stat(layer1.Path); os.IsNotExist(err) {
+		t.Error("Shared layer was incorrectly removed")
+	}
+
+	// Verify non-shared layer (layer2) was removed
+	if _, err := os.Stat(layer2.Path); !os.IsNotExist(err) {
+		t.Error("Unshared layer was not removed")
+	}
+}
+
+func TestImageService_LayerCache(t *testing.T) {
+	cache := NewLayerCache()
+
+	// Test adding and getting
+	metadata := LayerMetadata{
+		Digest: "sha256:test",
+		Path:   "/test/path",
+		Size:   100,
+	}
+	cache.Add(metadata.Digest, metadata)
+
+	if got, exists := cache.Get(metadata.Digest); !exists {
+		t.Error("Layer not found in cache")
+	} else if got != metadata {
+		t.Errorf("Layer metadata = %v, want %v", got, metadata)
+	}
+
+	// Test deleting
+	cache.Remove(metadata.Digest)
+	if _, exists := cache.Get(metadata.Digest); exists {
+		t.Error("Layer still exists after removal")
+	}
+
+	// Test concurrent safety
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			digest := fmt.Sprintf("sha256:test%d", i)
+			metadata := LayerMetadata{
+				Digest: digest,
+				Path:   fmt.Sprintf("/test/path%d", i),
+				Size:   int64(i * 100),
+			}
+			cache.Add(digest, metadata)
+			if _, exists := cache.Get(digest); !exists {
+				t.Errorf("Layer %s not found after concurrent add", digest)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

@@ -63,13 +63,13 @@ func (s *ImageService) pullImage(ctx context.Context, imageRef string, auth *run
 	// First check API version
 	checkURL := fmt.Sprintf("https://%s/v2/", registry)
 	if err := s.checkRegistry(ctx, checkURL, auth); err != nil {
-		return "", fmt.Errorf("failed to check registry: %v", err)
+		return "", err
 	}
 
 	// Get manifest and download layers
 	dgst, totalSize, err := s.downloadImage(ctx, registry, repository, tag, imageRef, auth)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to download image: %v", err)
 	}
 
 	// Create image ID and save metadata
@@ -100,15 +100,30 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 
 	// Create image directory
 	dgst := digest.FromString(imageRef)
+	imageID := fmt.Sprintf("sha256:%x", dgst.Hex())
 	imageDir := filepath.Join(s.imageRoot, dgst.Hex())
 	if err := os.MkdirAll(imageDir, 0755); err != nil {
 		return "", 0, fmt.Errorf("failed to create image directory: %v", err)
 	}
 
 	// Download layers
+	var layers []LayerMetadata
 	var totalSize int64
 	for i, layer := range manifest.Layers {
 		layerDir := filepath.Join(imageDir, fmt.Sprintf("layer-%d", i))
+		layerPath := filepath.Join(layerDir, "layer.tar")
+
+		// Check if layer already exists
+		if metadata, exists := s.layerCache.Get(layer.Digest); exists {
+			fmt.Printf("Reusing existing layer: %s\n", layer.Digest)
+			if err := reuseLayer(metadata.Path, layerPath); err != nil {
+				return "", 0, fmt.Errorf("failed to reuse layer: %v", err)
+			}
+			layers = append(layers, metadata)
+			totalSize += metadata.Size
+			continue
+		}
+
 		if err := os.MkdirAll(layerDir, 0755); err != nil {
 			return "", 0, fmt.Errorf("failed to create layer directory: %v", err)
 		}
@@ -118,25 +133,56 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 			return "", 0, fmt.Errorf("failed to download layer %d: %v", i, err)
 		}
 
+		// Get layer size
+		fi, err := os.Stat(layerPath)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to get layer size: %v", err)
+		}
+
+		// Create and cache layer metadata
+		metadata := LayerMetadata{
+			Digest: layer.Digest,
+			Path:   layerPath,
+			Size:   fi.Size(),
+		}
+		s.layerCache.Add(layer.Digest, metadata)
+		layers = append(layers, metadata)
 		totalSize += layer.Size
 	}
 
+	// Save image metadata
+	s.mu.Lock()
+	s.images[imageRef] = &imageMetadata{
+		ID:          imageID,
+		RepoTags:    []string{imageRef},
+		RepoDigests: []string{fmt.Sprintf("%s@%s", imageRef, dgst)},
+		Size:        totalSize,
+		Layers:      layers,
+	}
+	s.mu.Unlock()
+
+	if err := s.saveMetadata(); err != nil {
+		return "", 0, fmt.Errorf("failed to save metadata: %v", err)
+	}
+
+	fmt.Printf("Successfully pulled image: %s\n", imageRef)
 	return dgst, totalSize, nil
 }
 
 func (s *ImageService) getManifest(ctx context.Context, url string, auth *runtime.AuthConfig) (*DockerManifest, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
 	if auth != nil {
-		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
+		req.SetBasicAuth(auth.Username, auth.Password)
 	}
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get manifest: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -152,17 +198,16 @@ func (s *ImageService) getManifest(ctx context.Context, url string, auth *runtim
 	return &manifest, nil
 }
 
-func (s *ImageService) downloadLayer(ctx context.Context, url, destDir string, expectedDigest string, auth *runtime.AuthConfig) error {
+func (s *ImageService) downloadLayer(ctx context.Context, url, destDir, expectedDigest string, auth *runtime.AuthConfig) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create request: %v", err)
 	}
 
 	if auth != nil {
-		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
+		req.SetBasicAuth(auth.Username, auth.Password)
 	}
 
-	fmt.Printf("Downloading layer from: %s\n", url)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download layer: %v", err)
@@ -214,28 +259,32 @@ func (s *ImageService) saveLayer(destDir string, reader io.Reader, expectedDiges
 func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runtime.AuthConfig) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create request: %v", err)
 	}
 
 	if auth != nil {
-		req.SetBasicAuth(auth.GetUsername(), auth.GetPassword())
+		req.SetBasicAuth(auth.Username, auth.Password)
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to check registry: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusUnauthorized {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusUnauthorized:
+		if auth == nil {
+			return fmt.Errorf("authentication required")
+		}
+		fallthrough
+	case http.StatusForbidden:
+		return fmt.Errorf("authentication failed: %s", resp.Status)
+	default:
 		return fmt.Errorf("registry check failed: %s", resp.Status)
 	}
-
-	if resp.StatusCode == http.StatusUnauthorized && auth == nil {
-		return fmt.Errorf("authentication required")
-	}
-
-	return nil
 }
 
 func (s *ImageService) removeImage(ctx context.Context, imageRef string) error {
@@ -261,6 +310,32 @@ func (s *ImageService) removeImage(ctx context.Context, imageRef string) error {
 	// Double check image still exists
 	if _, ok := s.images[imageRef]; !ok {
 		return fmt.Errorf("image was removed by another operation: %s", imageRef)
+	}
+
+	// Get image metadata
+	img, ok := s.images[imageRef]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("image was removed by another operation: %s", imageRef)
+	}
+
+	// Check if other images are using the same layers
+	layersInUse := make(map[string]bool)
+	for _, otherImg := range s.images {
+		if otherImg.ID == img.ID {
+			continue
+		}
+		for _, layer := range otherImg.Layers {
+			layersInUse[layer.Digest] = true
+		}
+	}
+
+	// Remove layers not used by other images
+	for _, layer := range img.Layers {
+		if !layersInUse[layer.Digest] {
+			os.Remove(layer.Path)
+			s.layerCache.Remove(layer.Digest)
+		}
 	}
 
 	delete(s.images, imageRef)
