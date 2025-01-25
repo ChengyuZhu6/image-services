@@ -13,6 +13,19 @@ type GarbageCollector struct {
 	interval     time.Duration
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
+	stats        GCStats
+}
+
+type GCStats struct {
+	LastRun            time.Time
+	TotalCollections   int
+	TotalLayersRemoved int
+	LastCollectionSize int64
+}
+
+// GetStats returns current garbage collection statistics
+func (gc *GarbageCollector) GetStats() GCStats {
+	return gc.stats
 }
 
 func NewGarbageCollector(imageService *ImageService, interval time.Duration) *GarbageCollector {
@@ -52,6 +65,7 @@ func (gc *GarbageCollector) run() {
 
 func (gc *GarbageCollector) collectGarbage() error {
 	fmt.Println("Starting garbage collection...")
+	start := time.Now()
 
 	// Get all layer files in the image root
 	layerFiles := make(map[string]bool)
@@ -80,8 +94,14 @@ func (gc *GarbageCollector) collectGarbage() error {
 
 	// Remove unreferenced layer files
 	var removed int
+	var totalSize int64
 	for path := range layerFiles {
 		if !referencedLayers[path] {
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			totalSize += info.Size()
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("Failed to remove unreferenced layer %s: %v\n", path, err)
 				continue
@@ -90,6 +110,13 @@ func (gc *GarbageCollector) collectGarbage() error {
 		}
 	}
 
-	fmt.Printf("Garbage collection completed: removed %d unreferenced layers\n", removed)
+	// Update stats
+	gc.stats.LastRun = start
+	gc.stats.TotalCollections++
+	gc.stats.TotalLayersRemoved += removed
+	gc.stats.LastCollectionSize = totalSize
+
+	fmt.Printf("Garbage collection completed: removed %d unreferenced layers (%.2f MB)\n",
+		removed, float64(totalSize)/1024/1024)
 	return nil
 }
