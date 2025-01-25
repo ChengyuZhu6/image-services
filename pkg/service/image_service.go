@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -43,6 +44,7 @@ type ImageService struct {
 	mu           sync.RWMutex
 	metadataFile string
 	layerCache   *LayerCache
+	gc           *GarbageCollector
 }
 
 func NewImageService() *ImageService {
@@ -74,6 +76,10 @@ func NewImageService() *ImageService {
 	if err := service.loadMetadata(); err != nil {
 		panic(fmt.Sprintf("Failed to load metadata: %v", err))
 	}
+
+	// Initialize and start garbage collector
+	service.gc = NewGarbageCollector(service, 1*time.Hour)
+	service.gc.Start()
 
 	return service
 }
@@ -135,4 +141,12 @@ func (s *ImageService) AddImage(imageRef string, img *imageMetadata) error {
 
 	s.images[imageRef] = img
 	return s.saveMetadata()
+}
+
+// Close stops the image service and its components
+func (s *ImageService) Close() error {
+	if s.gc != nil {
+		s.gc.Stop()
+	}
+	return nil
 }
