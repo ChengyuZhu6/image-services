@@ -609,3 +609,57 @@ func TestLayerCache_StressTest(t *testing.T) {
 	t.Logf("Final cache size: %d", cache.totalSize)
 	t.Logf("Number of layers: %d", len(cache.layers))
 }
+
+func TestLayerCache_ConcurrentAddAndGet(t *testing.T) {
+	cache := NewLayerCache(int64(10000)) // Increase cache size to prevent eviction
+
+	// Create channels to coordinate test results
+	results := make(chan error, 10)
+	var wg sync.WaitGroup
+
+	// Test concurrent safety
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			// Create unique digest and metadata
+			digest := fmt.Sprintf("sha256:test%d", i)
+			metadata := LayerMetadata{
+				Digest: digest,
+				Path:   fmt.Sprintf("/test/path%d", i),
+				Size:   int64(i * 100),
+			}
+
+			// Add to cache
+			cache.Add(digest, metadata)
+
+			// Give some time for the add operation to complete
+			time.Sleep(time.Millisecond)
+
+			// Verify layer was added
+			got, exists := cache.Get(digest)
+			if !exists {
+				results <- fmt.Errorf("layer %s not found after add", digest)
+				return
+			}
+			if got.Path != metadata.Path {
+				results <- fmt.Errorf("layer %s has wrong path: got %s, want %s",
+					digest, got.Path, metadata.Path)
+				return
+			}
+			results <- nil
+		}(i)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(results)
+
+	// Check for any errors
+	for err := range results {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+}

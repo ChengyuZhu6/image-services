@@ -35,15 +35,16 @@ func NewLayerCache(maxSize int64) *LayerCache {
 	}
 }
 
-// Get retrieves layer metadata
+// Get retrieves a layer from the cache
 func (c *LayerCache) Get(digest string) (LayerMetadata, bool) {
-	c.mu.Lock()
+	c.mu.Lock() // Use full lock to ensure consistency
 	defer c.mu.Unlock()
-	layer, exists := c.layers[digest]
+
+	metadata, exists := c.layers[digest]
 	if exists {
 		c.lastUsed[digest] = time.Now()
 	}
-	return layer, exists
+	return metadata, exists
 }
 
 // Add adds a layer to the cache
@@ -51,50 +52,51 @@ func (c *LayerCache) Add(digest string, metadata LayerMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Ignore negative sizes
-	if metadata.Size < 0 {
+	// Validate inputs
+	if digest == "" || metadata.Size < 0 {
 		return
 	}
 
-	// Update total size
-	c.totalSize += metadata.Size - c.layers[digest].Size
-
-	// If we would exceed maxSize, remove least recently used layers
-	if c.maxSize > 0 && c.totalSize > c.maxSize {
-		c.evictLRU()
+	// Check if layer already exists
+	if existing, exists := c.layers[digest]; exists {
+		c.totalSize -= existing.Size
 	}
 
+	// Add new layer
 	c.layers[digest] = metadata
 	c.lastUsed[digest] = time.Now()
-}
+	c.totalSize += metadata.Size
 
-// Remove removes a layer from the cache
-func (c *LayerCache) Remove(digest string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if metadata, exists := c.layers[digest]; exists {
-		c.totalSize -= metadata.Size
-		delete(c.layers, digest)
-		delete(c.lastUsed, digest)
+	// If we exceed maxSize, evict layers
+	if c.maxSize > 0 && c.totalSize > c.maxSize {
+		c.evictLRULocked()
 	}
 }
 
-// evictLRU removes least recently used layers until cache size is under maxSize
-func (c *LayerCache) evictLRU() {
-	// Sort layers by last used time
+// evictLRULocked removes least recently used layers until cache size is under maxSize
+// Caller must hold the lock
+func (c *LayerCache) evictLRULocked() {
+	// Create a slice of all layers sorted by last used time
 	type layerInfo struct {
 		digest string
 		used   time.Time
 		size   int64
 	}
-	var layers []layerInfo
+
+	layers := make([]layerInfo, 0, len(c.layers))
 	for digest, metadata := range c.layers {
+		lastUsed, ok := c.lastUsed[digest]
+		if !ok {
+			lastUsed = time.Now() // Default to now if no last used time
+		}
 		layers = append(layers, layerInfo{
 			digest: digest,
-			used:   c.lastUsed[digest],
+			used:   lastUsed,
 			size:   metadata.Size,
 		})
 	}
+
+	// Sort by last used time
 	sort.Slice(layers, func(i, j int) bool {
 		return layers[i].used.Before(layers[j].used)
 	})
@@ -109,6 +111,18 @@ func (c *LayerCache) evictLRU() {
 			delete(c.layers, layer.digest)
 			delete(c.lastUsed, layer.digest)
 		}
+	}
+}
+
+// Remove removes a layer from the cache
+func (c *LayerCache) Remove(digest string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if metadata, exists := c.layers[digest]; exists {
+		c.totalSize -= metadata.Size
+		delete(c.layers, digest)
+		delete(c.lastUsed, digest)
 	}
 }
 
