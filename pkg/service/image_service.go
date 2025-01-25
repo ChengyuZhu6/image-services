@@ -52,6 +52,9 @@ func NewImageService() *ImageService {
 		panic(fmt.Sprintf("Failed to create image root directory: %v", err))
 	}
 
+	// Set default cache size limit to 10GB
+	const defaultMaxCacheSize = 10 * 1024 * 1024 * 1024
+
 	// Create HTTP client with insecure HTTPS support
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -64,7 +67,7 @@ func NewImageService() *ImageService {
 		imageRoot:    imageRoot,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(imageRoot, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(defaultMaxCacheSize),
 	}
 
 	// Load existing metadata

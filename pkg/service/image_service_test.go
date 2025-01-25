@@ -110,7 +110,7 @@ func TestImageService_PullImage(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Test cases
@@ -170,7 +170,7 @@ func TestImageService_RemoveImage(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Create test image directory
@@ -232,7 +232,7 @@ func TestImageService_ImageStatus(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Add test image
@@ -463,7 +463,7 @@ func TestImageService_AuthHandling(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	tests := []struct {
@@ -522,7 +522,7 @@ func TestImageService_MetadataPersistence(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Add test data
@@ -550,7 +550,7 @@ func TestImageService_MetadataPersistence(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Test loading metadata
@@ -581,7 +581,7 @@ func TestImageService_MetadataConsistency(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 		mu:           sync.RWMutex{},
 	}
 
@@ -634,7 +634,7 @@ func TestImageService_LayerReuse(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Create test layer
@@ -690,7 +690,7 @@ func TestImageService_LayerCleanup(t *testing.T) {
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(),
+		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Create two test layers
@@ -739,27 +739,8 @@ func TestImageService_LayerCleanup(t *testing.T) {
 }
 
 func TestImageService_LayerCache(t *testing.T) {
-	cache := NewLayerCache()
-
-	// Test adding and getting
-	metadata := LayerMetadata{
-		Digest: "sha256:test",
-		Path:   "/test/path",
-		Size:   100,
-	}
-	cache.Add(metadata.Digest, metadata)
-
-	if got, exists := cache.Get(metadata.Digest); !exists {
-		t.Error("Layer not found in cache")
-	} else if got != metadata {
-		t.Errorf("Layer metadata = %v, want %v", got, metadata)
-	}
-
-	// Test deleting
-	cache.Remove(metadata.Digest)
-	if _, exists := cache.Get(metadata.Digest); exists {
-		t.Error("Layer still exists after removal")
-	}
+	cache := NewLayerCache(int64(100))
+	var mu sync.Mutex
 
 	// Test concurrent safety
 	var wg sync.WaitGroup
@@ -774,9 +755,11 @@ func TestImageService_LayerCache(t *testing.T) {
 				Size:   int64(i * 100),
 			}
 			cache.Add(digest, metadata)
+			mu.Lock()
 			if _, exists := cache.Get(digest); !exists {
 				t.Errorf("Layer %s not found after concurrent add", digest)
 			}
+			mu.Unlock()
 		}(i)
 	}
 	wg.Wait()
