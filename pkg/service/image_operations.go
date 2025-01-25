@@ -289,41 +289,28 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 }
 
 func (s *ImageService) removeImage(ctx context.Context, imageRef string) error {
-	// First check if image exists with read lock
-	s.mu.RLock()
-	_, exists := s.images[imageRef]
-	s.mu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("image not found: %s", imageRef)
-	}
-
-	// Remove image directory
-	imageDir := filepath.Join(s.imageRoot, digest.FromString(imageRef).Hex())
-	if err := os.RemoveAll(imageDir); err != nil {
-		return fmt.Errorf("failed to remove image directory: %v", err)
-	}
-
-	// Now acquire write lock for metadata update
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// Double check image still exists
-	if _, ok := s.images[imageRef]; !ok {
-		return fmt.Errorf("image was removed by another operation: %s", imageRef)
-	}
 
 	// Get image metadata
 	img, ok := s.images[imageRef]
 	if !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("image was removed by another operation: %s", imageRef)
+		return fmt.Errorf("image not found: %s", imageRef)
 	}
 
-	// Check if other images are using the same layers
+	// Get image directory path
+	dgst := digest.FromString(imageRef)
+	imageDir := filepath.Join(s.imageRoot, dgst.Hex())
+
+	// Remove image directory
+	if err := os.RemoveAll(imageDir); err != nil {
+		return fmt.Errorf("failed to remove image directory: %v", err)
+	}
+
+	// Check which layers are used by other images
 	layersInUse := make(map[string]bool)
-	for _, otherImg := range s.images {
-		if otherImg.ID == img.ID {
+	for ref, otherImg := range s.images {
+		if ref == imageRef {
 			continue
 		}
 		for _, layer := range otherImg.Layers {
@@ -332,19 +319,27 @@ func (s *ImageService) removeImage(ctx context.Context, imageRef string) error {
 	}
 
 	// Remove layers not used by other images
-	for _, layer := range img.Layers {
-		if !layersInUse[layer.Digest] {
-			os.Remove(layer.Path)
-			s.layerCache.Remove(layer.Digest)
+	if img.Layers != nil {
+		for _, layer := range img.Layers {
+			if !layersInUse[layer.Digest] {
+				// Remove from cache and filesystem
+				s.layerCache.Remove(layer.Digest)
+				// Also remove the layer file directly in case it's not in cache
+				if layer.Path != "" {
+					os.Remove(layer.Path)
+				}
+			}
 		}
 	}
 
+	// Remove image from metadata
 	delete(s.images, imageRef)
+
+	// Save updated metadata
 	if err := s.saveMetadata(); err != nil {
 		return fmt.Errorf("failed to save metadata: %v", err)
 	}
 
-	fmt.Printf("Successfully removed image: %s\n", imageRef)
 	return nil
 }
 

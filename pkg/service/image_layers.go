@@ -37,14 +37,17 @@ func NewLayerCache(maxSize int64) *LayerCache {
 
 // Get retrieves a layer from the cache
 func (c *LayerCache) Get(digest string) (LayerMetadata, bool) {
-	c.mu.Lock() // Use full lock to ensure consistency
+	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	metadata, exists := c.layers[digest]
-	if exists {
-		c.lastUsed[digest] = time.Now()
+	if !exists {
+		return LayerMetadata{}, false
 	}
-	return metadata, exists
+
+	// Update last used time
+	c.lastUsed[digest] = time.Now()
+	return metadata, true
 }
 
 // Add adds a layer to the cache
@@ -57,26 +60,47 @@ func (c *LayerCache) Add(digest string, metadata LayerMetadata) {
 		return
 	}
 
-	// Check if layer already exists
+	// If maxSize is 0, accept all layers
+	if c.maxSize == 0 {
+		if existing, exists := c.layers[digest]; exists {
+			c.totalSize -= existing.Size
+		}
+		c.layers[digest] = metadata
+		c.lastUsed[digest] = time.Now()
+		c.totalSize += metadata.Size
+		return
+	}
+
+	// If the new layer alone exceeds maxSize, don't add it
+	if metadata.Size > c.maxSize {
+		return
+	}
+
+	// First remove existing layer if it exists
 	if existing, exists := c.layers[digest]; exists {
 		c.totalSize -= existing.Size
 	}
 
-	// Add new layer
+	// Check if adding this layer would exceed maxSize
+	if c.totalSize+metadata.Size > c.maxSize {
+		// Need to evict layers before adding new one
+		c.evictLayers(c.totalSize + metadata.Size - c.maxSize)
+	}
+
+	// Now add the layer
 	c.layers[digest] = metadata
 	c.lastUsed[digest] = time.Now()
 	c.totalSize += metadata.Size
-
-	// If we exceed maxSize, evict layers
-	if c.maxSize > 0 && c.totalSize > c.maxSize {
-		c.evictLRULocked()
-	}
 }
 
-// evictLRULocked removes least recently used layers until cache size is under maxSize
+// evictLayers removes least recently used layers until enough space is freed
 // Caller must hold the lock
-func (c *LayerCache) evictLRULocked() {
-	// Create a slice of all layers sorted by last used time
+func (c *LayerCache) evictLayers(spaceNeeded int64) {
+	if spaceNeeded <= 0 {
+		return
+	}
+
+	// Create sorted slice of layers by last used time
 	type layerInfo struct {
 		digest string
 		used   time.Time
@@ -85,28 +109,41 @@ func (c *LayerCache) evictLRULocked() {
 
 	layers := make([]layerInfo, 0, len(c.layers))
 	for digest, metadata := range c.layers {
-		lastUsed, ok := c.lastUsed[digest]
-		if !ok {
-			lastUsed = time.Now() // Default to now if no last used time
+		// Skip zero-size layers from eviction
+		if metadata.Size > 0 {
+			lastUsed, ok := c.lastUsed[digest]
+			if !ok {
+				lastUsed = time.Now()
+			}
+			layers = append(layers, layerInfo{
+				digest: digest,
+				used:   lastUsed,
+				size:   metadata.Size,
+			})
 		}
-		layers = append(layers, layerInfo{
-			digest: digest,
-			used:   lastUsed,
-			size:   metadata.Size,
-		})
 	}
 
-	// Sort by last used time
+	// Sort by last used time (oldest first)
 	sort.Slice(layers, func(i, j int) bool {
 		return layers[i].used.Before(layers[j].used)
 	})
 
-	// Remove oldest layers until we're under maxSize
+	// Remove oldest layers until we have enough space
+	spaceFreed := int64(0)
 	for _, layer := range layers {
-		if c.totalSize <= c.maxSize {
+		if spaceFreed >= spaceNeeded {
 			break
 		}
 		if metadata, exists := c.layers[layer.digest]; exists {
+			// Remove the layer file first
+			if metadata.Path != "" {
+				if err := os.Remove(metadata.Path); err != nil && !os.IsNotExist(err) {
+					// Log error but continue with cache cleanup
+					fmt.Printf("Failed to remove layer file %s: %v\n", metadata.Path, err)
+				}
+			}
+			// Then update cache state
+			spaceFreed += metadata.Size
 			c.totalSize -= metadata.Size
 			delete(c.layers, layer.digest)
 			delete(c.lastUsed, layer.digest)
@@ -114,12 +151,20 @@ func (c *LayerCache) evictLRULocked() {
 	}
 }
 
-// Remove removes a layer from the cache
+// Remove removes a layer from the cache and its file
 func (c *LayerCache) Remove(digest string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if metadata, exists := c.layers[digest]; exists {
+		// Remove the layer file first
+		if metadata.Path != "" {
+			if err := os.Remove(metadata.Path); err != nil && !os.IsNotExist(err) {
+				// Log error but continue with cache cleanup
+				fmt.Printf("Failed to remove layer file %s: %v\n", metadata.Path, err)
+			}
+		}
+		// Then update cache state
 		c.totalSize -= metadata.Size
 		delete(c.layers, digest)
 		delete(c.lastUsed, digest)
@@ -128,7 +173,12 @@ func (c *LayerCache) Remove(digest string) {
 
 // reuseLayer reuses an existing layer
 func reuseLayer(srcPath, destPath string) error {
-	// Ensure destination directory exists
+	// Ensure source file exists
+	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+		return fmt.Errorf("source file does not exist: %v", err)
+	}
+
+	// Create destination directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return fmt.Errorf("failed to create destination directory: %v", err)
 	}
