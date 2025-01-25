@@ -157,15 +157,10 @@ func (c *LayerCache) Remove(digest string) {
 	defer c.mu.Unlock()
 
 	if metadata, exists := c.layers[digest]; exists {
-		// Remove the layer file first
-		if metadata.Path != "" {
-			if err := os.Remove(metadata.Path); err != nil && !os.IsNotExist(err) {
-				// Log error but continue with cache cleanup
-				fmt.Printf("Failed to remove layer file %s: %v\n", metadata.Path, err)
-			}
-		}
-		// Then update cache state
+		// Update total size
 		c.totalSize -= metadata.Size
+
+		// Remove from maps
 		delete(c.layers, digest)
 		delete(c.lastUsed, digest)
 	}
@@ -173,17 +168,20 @@ func (c *LayerCache) Remove(digest string) {
 
 // reuseLayer reuses an existing layer
 func reuseLayer(srcPath, destPath string) error {
-	// Ensure source file exists
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		return fmt.Errorf("source file does not exist: %v", err)
+	// Ensure source file exists and is accessible
+	if _, err := os.Stat(srcPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("source file does not exist: %v", err)
+		}
+		return fmt.Errorf("failed to access source file: %v", err)
 	}
 
-	// Create destination directory if it doesn't exist
+	// Create destination directory
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return fmt.Errorf("failed to create destination directory: %v", err)
 	}
 
-	// Try to create a hard link first
+	// Try to create hard link
 	if err := os.Link(srcPath, destPath); err == nil {
 		return nil
 	}
@@ -202,7 +200,7 @@ func reuseLayer(srcPath, destPath string) error {
 	defer dst.Close()
 
 	if _, err := io.Copy(dst, src); err != nil {
-		os.Remove(destPath)
+		os.Remove(destPath) // Clean up failed file
 		return fmt.Errorf("failed to copy file: %v", err)
 	}
 
