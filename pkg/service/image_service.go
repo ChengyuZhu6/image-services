@@ -29,10 +29,11 @@ import (
 )
 
 type imageMetadata struct {
-	ID          string   `json:"id"`
-	RepoTags    []string `json:"repo_tags"`
-	RepoDigests []string `json:"repo_digests"`
-	Size        int64    `json:"size"`
+	ID          string          `json:"id"`
+	RepoTags    []string        `json:"repo_tags"`
+	RepoDigests []string        `json:"repo_digests"`
+	Size        int64           `json:"size"`
+	Layers      []LayerMetadata `json:"layers"`
 }
 
 type ImageService struct {
@@ -41,6 +42,7 @@ type ImageService struct {
 	images       map[string]*imageMetadata
 	mu           sync.RWMutex
 	metadataFile string
+	layerCache   *LayerCache
 }
 
 func NewImageService() *ImageService {
@@ -62,6 +64,7 @@ func NewImageService() *ImageService {
 		imageRoot:    imageRoot,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(imageRoot, "metadata.json"),
+		layerCache:   NewLayerCache(),
 	}
 
 	// Load existing metadata
