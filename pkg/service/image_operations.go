@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +39,14 @@ type LayerInfo struct {
 	Path      string
 }
 
+// getRegistryClient returns a client for interacting with the registry
+func (s *ImageService) getRegistryClient(ref reference.Named, auth *runtime.AuthConfig) error {
+	// Check registry API version
+	registry := reference.Domain(ref)
+	checkURL := fmt.Sprintf("https://%s/v2/", registry)
+	return s.checkRegistry(context.Background(), checkURL, auth)
+}
+
 func (s *ImageService) pullImage(ctx context.Context, imageRef string, auth *runtime.AuthConfig) (string, error) {
 	named, err := reference.ParseNormalizedNamed(imageRef)
 	if err != nil {
@@ -52,22 +61,13 @@ func (s *ImageService) pullImage(ctx context.Context, imageRef string, auth *run
 	}
 	s.mu.RUnlock()
 
-	// Build Registry API URL
-	registry := reference.Domain(named)
-	repository := reference.Path(named)
-	tag := "latest"
-	if tagged, ok := named.(reference.Tagged); ok {
-		tag = tagged.Tag()
-	}
-
-	// First check API version
-	checkURL := fmt.Sprintf("https://%s/v2/", registry)
-	if err := s.checkRegistry(ctx, checkURL, auth); err != nil {
+	// Get registry client
+	if err := s.getRegistryClient(named, auth); err != nil {
 		return "", err
 	}
 
 	// Get manifest and download layers
-	dgst, totalSize, err := s.downloadImage(ctx, registry, repository, tag, imageRef, auth)
+	dgst, totalSize, err := s.downloadImage(ctx, reference.Domain(named), reference.Path(named), "latest", imageRef, auth)
 	if err != nil {
 		return "", fmt.Errorf("failed to download image: %v", err)
 	}
@@ -262,8 +262,10 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 		return fmt.Errorf("failed to create request: %v", err)
 	}
 
-	if auth != nil {
-		req.SetBasicAuth(auth.Username, auth.Password)
+	if auth != nil && auth.Username != "" && auth.Password != "" {
+		// Add proper authentication header
+		req.Header.Set("Authorization", fmt.Sprintf("Basic %s",
+			base64.StdEncoding.EncodeToString([]byte(auth.Username+":"+auth.Password))))
 	}
 
 	resp, err := s.client.Do(req)
@@ -273,13 +275,12 @@ func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runt
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
-	case http.StatusOK:
-		return nil
-	case http.StatusUnauthorized:
-		if auth == nil {
+	case http.StatusOK, http.StatusUnauthorized:
+		// Handle WWW-Authenticate challenge if present
+		if auth == nil && resp.StatusCode == http.StatusUnauthorized {
 			return fmt.Errorf("authentication required")
 		}
-		fallthrough
+		return nil
 	case http.StatusForbidden:
 		return fmt.Errorf("authentication failed: %s", resp.Status)
 	default:

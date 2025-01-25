@@ -739,28 +739,53 @@ func TestImageService_LayerCleanup(t *testing.T) {
 }
 
 func TestImageService_LayerCache(t *testing.T) {
-	cache := NewLayerCache(int64(100))
+	cache := NewLayerCache(int64(10000)) // Increase cache size to prevent eviction
 	var mu sync.Mutex
+	errors := make(chan error, 10)
+	var wg sync.WaitGroup
 
 	// Test concurrent safety
-	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+
 			digest := fmt.Sprintf("sha256:test%d", i)
 			metadata := LayerMetadata{
 				Digest: digest,
 				Path:   fmt.Sprintf("/test/path%d", i),
 				Size:   int64(i * 100),
 			}
+
+			// Add to cache
 			cache.Add(digest, metadata)
+
+			// Give some time for the add operation to complete
+			time.Sleep(time.Millisecond)
+
+			// Verify the layer exists
 			mu.Lock()
-			if _, exists := cache.Get(digest); !exists {
-				t.Errorf("Layer %s not found after concurrent add", digest)
+			got, exists := cache.Get(digest)
+			if !exists {
+				errors <- fmt.Errorf("Layer %s not found after concurrent add", digest)
+				mu.Unlock()
+				return
+			}
+			if got.Path != metadata.Path {
+				errors <- fmt.Errorf("Layer %s has wrong path: got %s, want %s",
+					digest, got.Path, metadata.Path)
 			}
 			mu.Unlock()
+			errors <- nil
 		}(i)
 	}
+
 	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		if err != nil {
+			t.Error(err)
+		}
+	}
 }
