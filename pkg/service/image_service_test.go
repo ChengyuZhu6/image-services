@@ -40,24 +40,14 @@ func TestImageService_PullImage(t *testing.T) {
 
 	// Setup mock registry server
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		defer func() {
-			t.Logf("Request took: %v", time.Since(start))
-		}()
-
-		// Add request logging
-		t.Logf("Received request: %s %s", r.Method, r.URL.Path)
-		defer t.Logf("Completed request: %s %s", r.Method, r.URL.Path)
 
 		switch r.URL.Path {
 		case "/v2/":
-			t.Log("Handling /v2/ request")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{}`))
 			return
 		case "/v2/library/test/blobs/" + expectedDigest:
-			t.Log("Handling blob request")
 			// Mock layer download
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fixedContent)))
@@ -65,7 +55,6 @@ func TestImageService_PullImage(t *testing.T) {
 			w.Write(fixedContent)
 			return
 		case "/v2/library/test/manifests/latest":
-			t.Log("Handling manifest request")
 			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
 			w.Header().Set("Docker-Content-Digest", expectedDigest)
 			manifestContent := []byte(`{
@@ -89,7 +78,6 @@ func TestImageService_PullImage(t *testing.T) {
 			w.Write(manifestContent)
 			return
 		default:
-			t.Log("Handling unknown request")
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte(`{"errors":[{"code":"NOT_FOUND"}]}`))
 			return

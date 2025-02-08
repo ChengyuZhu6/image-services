@@ -117,7 +117,6 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 		if metadata, exists := s.layerCache.Get(layer.Digest); exists {
 			// Add additional check to ensure file exists
 			if _, err := os.Stat(metadata.Path); err == nil {
-				fmt.Printf("Reusing existing layer: %s\n", layer.Digest)
 				if err := reuseLayer(metadata.Path, layerPath); err != nil {
 					// If reuse fails, remove from cache and continue downloading
 					s.layerCache.Remove(layer.Digest)
@@ -171,7 +170,6 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 		return "", 0, fmt.Errorf("failed to save metadata: %v", err)
 	}
 
-	fmt.Printf("Successfully pulled image: %s\n", imageRef)
 	return dgst, totalSize, nil
 }
 
@@ -239,8 +237,7 @@ func (s *ImageService) saveLayer(destDir string, reader io.Reader, expectedDiges
 	digester := digest.Canonical.Digester()
 	writer := io.MultiWriter(f, digester.Hash())
 
-	fmt.Printf("Saving layer to: %s\n", tempPath)
-	size, err := io.Copy(writer, reader)
+	_, err = io.Copy(writer, reader)
 	f.Close()
 	if err != nil {
 		os.Remove(tempPath)
@@ -258,7 +255,6 @@ func (s *ImageService) saveLayer(destDir string, reader io.Reader, expectedDiges
 		return fmt.Errorf("failed to move verified layer: %v", err)
 	}
 
-	fmt.Printf("Layer verified and saved: size=%d, digest=%s\n", size, actualDigest)
 	return nil
 }
 
@@ -373,7 +369,6 @@ func (s *ImageService) saveMetadata() error {
 		return fmt.Errorf("failed to save metadata: %v", err)
 	}
 
-	fmt.Printf("Successfully saved metadata for %d images\n", len(s.images))
 	return nil
 }
 
