@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"cri-image-service/pkg/server"
 
@@ -31,15 +34,39 @@ const (
 	listen = "unix:///var/run/cri-image.sock"
 )
 
+func setupSocket(socketPath string) (net.Listener, func(), error) {
+	// Clean up existing socket file
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		return nil, nil, fmt.Errorf("failed to remove existing socket: %v", err)
+	}
+
+	// Create unix socket listener
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to listen: %v", err)
+	}
+
+	// Create cleanup function
+	cleanup := func() {
+		listener.Close()
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("Failed to cleanup socket: %v", err)
+		}
+	}
+
+	return listener, cleanup, nil
+}
+
 func main() {
 	// Remove unix socket prefix
 	endpoint := listen[7:]
 
-	// Create unix socket listener
-	listener, err := net.Listen("unix", endpoint)
+	// Setup socket and get cleanup function
+	listener, cleanup, err := setupSocket(endpoint)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("Failed to setup socket: %v", err)
 	}
+	defer cleanup()
 
 	// Create gRPC server
 	s := grpc.NewServer()
@@ -48,8 +75,19 @@ func main() {
 	imageServer := server.NewImageServer()
 	runtime.RegisterImageServiceServer(s, imageServer)
 
+	// Setup signal handling
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Start server
 	fmt.Printf("Starting CRI image service on %s\n", listen)
-	if err := s.Serve(listener); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+	go s.Serve(listener)
+
+	// Wait for interrupt
+	<-stop
+	fmt.Println("\nShutting down...")
+
+	// Stop server
+	s.GracefulStop()
+	fmt.Println("Server stopped")
 }
