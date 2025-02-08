@@ -580,7 +580,6 @@ func TestLayerCache_StressTest(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 
-	start := time.Now()
 	for i := 0; i < goroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
@@ -603,11 +602,6 @@ func TestLayerCache_StressTest(t *testing.T) {
 	}
 
 	wg.Wait()
-	duration := time.Since(start)
-
-	t.Logf("Stress test completed in %v", duration)
-	t.Logf("Final cache size: %d", cache.totalSize)
-	t.Logf("Number of layers: %d", len(cache.layers))
 }
 
 func TestLayerCache_ConcurrentAddAndGet(t *testing.T) {
