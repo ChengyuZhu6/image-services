@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+
+	"archive/tar"
+	"compress/gzip"
 
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -134,7 +138,8 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 		}
 
 		layerURL := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, layer.Digest)
-		if err := s.downloadLayer(ctx, layerURL, layerDir, layer.Digest, auth); err != nil {
+		uncompressedSize, err := s.downloadLayer(ctx, layerURL, layerDir, layer.Digest, auth)
+		if err != nil {
 			return "", 0, fmt.Errorf("failed to download layer %d: %v", i, err)
 		}
 
@@ -146,13 +151,14 @@ func (s *ImageService) downloadImage(ctx context.Context, registry, repository, 
 
 		// Create and cache layer metadata
 		metadata := LayerMetadata{
-			Digest: layer.Digest,
-			Path:   layerPath,
-			Size:   fi.Size(),
+			Digest:           layer.Digest,
+			Path:             layerPath,
+			Size:             fi.Size(),
+			UncompressedSize: uncompressedSize,
 		}
 		s.layerCache.Add(layer.Digest, metadata)
 		layers = append(layers, metadata)
-		totalSize += layer.Size
+		totalSize += uncompressedSize
 	}
 
 	// Save image metadata
@@ -202,10 +208,48 @@ func (s *ImageService) getManifest(ctx context.Context, url string, auth *runtim
 	return &manifest, nil
 }
 
-func (s *ImageService) downloadLayer(ctx context.Context, url, destDir, expectedDigest string, auth *runtime.AuthConfig) error {
+func getUncompressedSize(reader io.Reader) (int64, error) {
+	// Read all data into buffer to avoid consuming the reader
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read data: %v", err)
+	}
+
+	// Create new reader from buffer
+	bufReader := bytes.NewReader(data)
+
+	gzReader, err := gzip.NewReader(bufReader)
+	if err != nil {
+		// If not gzipped, return original size
+		return int64(len(data)), nil
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+	var totalSize int64
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// If not a valid tar, return gzipped size
+			return int64(len(data)), nil
+		}
+
+		if header.Typeflag == tar.TypeReg {
+			totalSize += header.Size
+		}
+	}
+
+	return totalSize, nil
+}
+
+func (s *ImageService) downloadLayer(ctx context.Context, url, destDir, expectedDigest string, auth *runtime.AuthConfig) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
+		return 0, fmt.Errorf("failed to create request: %v", err)
 	}
 
 	if auth != nil {
@@ -214,48 +258,78 @@ func (s *ImageService) downloadLayer(ctx context.Context, url, destDir, expected
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to download layer: %v", err)
+		return 0, fmt.Errorf("failed to download layer: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to download layer: %s", resp.Status)
+		return 0, fmt.Errorf("failed to download layer: %s", resp.Status)
 	}
 
-	return s.saveLayer(destDir, resp.Body, expectedDigest)
+	// Create a buffer to store response body
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// Get uncompressed size
+	uncompressedSize, err := getUncompressedSize(bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, fmt.Errorf("failed to get uncompressed size: %v", err)
+	}
+
+	// Save layer using the buffered data
+	if _, err := s.saveLayer(destDir, bytes.NewReader(bodyBytes), expectedDigest); err != nil {
+		return 0, err
+	}
+
+	// Update layer metadata with uncompressed size
+	layerPath := filepath.Join(destDir, "layer.tar")
+	fi, err := os.Stat(layerPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get layer size: %v", err)
+	}
+
+	metadata := LayerMetadata{
+		Digest:           expectedDigest,
+		Path:             layerPath,
+		Size:             fi.Size(),
+		UncompressedSize: uncompressedSize,
+	}
+	s.layerCache.Add(expectedDigest, metadata)
+
+	return uncompressedSize, nil
 }
 
-func (s *ImageService) saveLayer(destDir string, reader io.Reader, expectedDigest string) error {
+func (s *ImageService) saveLayer(destDir string, reader io.Reader, expectedDigest string) (int64, error) {
 	layerPath := filepath.Join(destDir, "layer.tar")
 	tempPath := layerPath + ".tmp"
 	f, err := os.Create(tempPath)
 	if err != nil {
-		return fmt.Errorf("failed to create layer file: %v", err)
+		return 0, fmt.Errorf("failed to create layer file: %v", err)
 	}
 	defer f.Close()
 
 	digester := digest.Canonical.Digester()
 	writer := io.MultiWriter(f, digester.Hash())
 
-	_, err = io.Copy(writer, reader)
-	f.Close()
-	if err != nil {
+	if _, err := io.Copy(writer, reader); err != nil {
 		os.Remove(tempPath)
-		return fmt.Errorf("failed to save layer: %v", err)
+		return 0, fmt.Errorf("failed to save layer: %v", err)
 	}
 
 	actualDigest := digester.Digest().String()
 	if actualDigest != expectedDigest {
 		os.Remove(tempPath)
-		return fmt.Errorf("layer digest mismatch: expected %s, got %s", expectedDigest, actualDigest)
+		return 0, fmt.Errorf("layer digest mismatch: expected %s, got %s", expectedDigest, actualDigest)
 	}
 
 	if err := os.Rename(tempPath, layerPath); err != nil {
 		os.Remove(tempPath)
-		return fmt.Errorf("failed to move verified layer: %v", err)
+		return 0, fmt.Errorf("failed to move verified layer: %v", err)
 	}
 
-	return nil
+	return 0, nil
 }
 
 func (s *ImageService) checkRegistry(ctx context.Context, url string, auth *runtime.AuthConfig) error {
