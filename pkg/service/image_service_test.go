@@ -17,7 +17,9 @@
 package service
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"net/http"
@@ -95,10 +97,10 @@ func TestImageService_PullImage(t *testing.T) {
 	// Create service instance
 	service := &ImageService{
 		client:       server.Client(),
+		layerCache:   NewLayerCache(100 * 1024 * 1024), // 100MB cache size
 		imageRoot:    tmpDir,
 		images:       make(map[string]*imageMetadata),
 		metadataFile: filepath.Join(tmpDir, "metadata.json"),
-		layerCache:   NewLayerCache(int64(100)),
 	}
 
 	// Test cases
@@ -299,9 +301,40 @@ func TestImageService_ListImages(t *testing.T) {
 
 // Test layer download verification
 func TestImageService_downloadLayer(t *testing.T) {
-	// Use fixed content that matches the expected digest
-	fixedContent := []byte("fixed layer content for testing")
-	expectedDigest := "sha256:86c354b41b3e24f565001dea1f4f9b460dfb08de45baea0f4b111afeed87d9dc"
+	// Create a gzipped tar file for testing
+	var buf bytes.Buffer
+	gzWriter := gzip.NewWriter(&buf)
+	tarWriter := tar.NewWriter(gzWriter)
+
+	// Add a test file to the tar
+	content := []byte("test file content")
+	hdr := &tar.Header{
+		Name: "test.txt",
+		Mode: 0600,
+		Size: int64(len(content)),
+	}
+	if err := tarWriter.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tarWriter.Write(content); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close writers
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixedContent := buf.Bytes()
+	// Calculate actual digest of the test data
+	digester := digest.Canonical.Digester()
+	if _, err := digester.Hash().Write(fixedContent); err != nil {
+		t.Fatal(err)
+	}
+	expectedDigest := digester.Digest().String()
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -316,7 +349,11 @@ func TestImageService_downloadLayer(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	service := &ImageService{
-		client: server.Client(),
+		client:       server.Client(),
+		imageRoot:    tmpDir,
+		layerCache:   NewLayerCache(100 * 1024 * 1024), // 100MB cache
+		images:       make(map[string]*imageMetadata),
+		metadataFile: filepath.Join(tmpDir, "metadata.json"),
 	}
 
 	tests := []struct {
@@ -347,7 +384,7 @@ func TestImageService_downloadLayer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := service.downloadLayer(context.Background(), tt.url, tmpDir, tt.expectedDigest, nil)
+			_, err := service.downloadLayer(context.Background(), tt.url, tmpDir, tt.expectedDigest, nil)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("downloadLayer() error = %v, wantErr %v", err, tt.wantErr)
 			}

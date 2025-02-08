@@ -12,9 +12,10 @@ import (
 
 // LayerMetadata stores layer metadata information
 type LayerMetadata struct {
-	Digest string `json:"digest"`
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
+	Digest           string `json:"digest"`
+	Path             string `json:"path"`
+	Size             int64  `json:"size"`
+	UncompressedSize int64  `json:"uncompressed_size"`
 }
 
 // LayerCache manages image layer caching
