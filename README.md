@@ -2,6 +2,17 @@
 
 A Container Runtime Interface (CRI) compatible image service for container image management.
 
+## Features
+
+### Image Management
+- **Layer Caching**: Efficiently caches image layers to avoid redundant downloads
+- **Garbage Collection**: Automatically removes unused layers to optimize storage
+- **Concurrent Operations**: Supports parallel image operations with thread safety
+- **Registry Authentication**: Handles private registry authentication
+- **Layer Deduplication**: Reuses identical layers across different images
+- **Compressed Layer Support**: Handles gzipped tar layers with automatic decompression
+- **Metadata Persistence**: Maintains image and layer metadata across service restarts
+
 ## Quick Start
 
 ### Build
@@ -36,12 +47,23 @@ EOF
 # Pull image
 crictl pull registry.domain.local/app:latest
 
+# Pull from private registry
+crictl pull --creds username:password registry.domain.local/private/app:latest
+
+# Pull using docker config credentials
+crictl pull --auth ~/.docker/config.json registry.domain.local/private/app:latest
+
 # List images
 crictl images
 
 # Remove image
 crictl rmi registry.domain.local/app:latest
 ```
+
+Note: For private registries, you can either:
+- Use `--creds` flag to provide username and password directly
+- Use `--auth` flag to specify path to docker config file containing registry credentials
+- Configure default credentials in `~/.docker/config.json`
 
 ## Service Management
 
